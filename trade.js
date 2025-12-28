@@ -8,10 +8,13 @@ var PROCESSED_LABEL_REPORT = '已處理-成交回報';
 
 /**
  * 處理所有郵件（交易明細表 + 成交回報資料）
+ * 處理完成後自動分割庫存明細並清理交易明細
  */
 function processAllEmails() {
     processTradeDetailEmails();
     processTradeReportEmails();
+    cleanupTradeSheet();          // 去除重複並修正股票代碼
+    splitInventoryByStock();      // 分割庫存明細
 }
 
 /**
@@ -134,11 +137,16 @@ function parseTradeReport(plainBody) {
 
         if (match) {
             // 保留股票代碼為字串，補零到4位或6位
-            var stockCode = match[4];
-            if (stockCode.length < 4) {
-                stockCode = stockCode.padStart(4, '0');
-            } else if (stockCode.length > 4 && stockCode.length < 6) {
-                stockCode = stockCode.padStart(6, '0');
+            var rawCode = match[4];
+            var stockCode;
+            if (rawCode === '50' || parseInt(rawCode) === 50) {
+                stockCode = '0050';
+            } else if (rawCode === '6208' || parseInt(rawCode) === 6208) {
+                stockCode = '006208';
+            } else if (rawCode.length <= 4) {
+                stockCode = rawCode.padStart(4, '0');
+            } else {
+                stockCode = rawCode.padStart(6, '0');
             }
 
             results.push([
@@ -174,7 +182,17 @@ function parseTradeDetailsV2(lines) {
             var source = match[1];
             var tradeType = match[2];
             var buySell = match[3];
-            var stockCode = match[4];
+            var rawCode = match[4];
+            var stockCode;
+            if (rawCode === '50' || parseInt(rawCode) === 50) {
+                stockCode = '0050';
+            } else if (rawCode === '6208' || parseInt(rawCode) === 6208) {
+                stockCode = '006208';
+            } else if (rawCode.length <= 4) {
+                stockCode = rawCode.padStart(4, '0');
+            } else {
+                stockCode = rawCode.padStart(6, '0');
+            }
 
             var nextLine = lines[i + 1];
             var nameMatch = nextLine.match(/^\((.+?)\)\s+(.+)/);
@@ -348,6 +366,86 @@ function clearSheet(ss, sheetName) {
 }
 
 /**
+ * 清理交易明細：去除重複資料並修正股票代碼格式
+ */
+function cleanupTradeSheet() {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName(TRADE_SHEET_NAME);
+
+    if (!sheet || sheet.getLastRow() < 2) {
+        Logger.log('交易明細無資料需要清理');
+        return;
+    }
+
+    var lastRow = sheet.getLastRow();
+    var lastCol = sheet.getLastColumn();
+    var data = sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+
+    // 建立唯一鍵來識別重複
+    var seen = {};
+    var uniqueData = [];
+    var duplicateCount = 0;
+
+    for (var i = 0; i < data.length; i++) {
+        var row = data[i];
+        var tradeDate = row[0];
+        var stockCode = String(row[4]);
+        var price = row[6];
+        var qty = row[7];
+        var mailType = row[12];
+
+        // 修正股票代碼格式
+        var rawCode = stockCode.replace(/^0+/, '');
+        if (rawCode === '50') {
+            row[4] = '0050';
+        } else if (rawCode === '6208') {
+            row[4] = '006208';
+        } else if (rawCode.length <= 4) {
+            row[4] = rawCode.padStart(4, '0');
+        } else {
+            row[4] = rawCode.padStart(6, '0');
+        }
+
+        // 建立唯一鍵（日期+股票+價格+數量）
+        var key = tradeDate + '|' + row[4] + '|' + price + '|' + qty;
+
+        if (seen[key]) {
+            // 已存在，檢查是否應該保留這筆
+            // 優先保留「交易明細表」（資料較完整）
+            if (mailType === '交易明細表') {
+                // 用交易明細表覆蓋成交回報
+                for (var j = 0; j < uniqueData.length; j++) {
+                    var existKey = uniqueData[j][0] + '|' + uniqueData[j][4] + '|' + uniqueData[j][6] + '|' + uniqueData[j][7];
+                    if (existKey === key && uniqueData[j][12] === '成交回報') {
+                        uniqueData[j] = row;
+                        break;
+                    }
+                }
+            }
+            duplicateCount++;
+        } else {
+            seen[key] = true;
+            uniqueData.push(row);
+        }
+    }
+
+    // 清空並重新寫入
+    if (lastRow > 1) {
+        sheet.deleteRows(2, lastRow - 1);
+    }
+
+    if (uniqueData.length > 0) {
+        sheet.getRange(2, 1, uniqueData.length, lastCol).setValues(uniqueData);
+
+        // 設定股票代碼欄為純文字格式
+        var codeRange = sheet.getRange(2, 5, uniqueData.length, 1);
+        codeRange.setNumberFormat('@');
+    }
+
+    Logger.log('交易明細清理完成：移除 ' + duplicateCount + ' 筆重複，保留 ' + uniqueData.length + ' 筆');
+}
+
+/**
  * 建立定時觸發器 - 每12小時
  */
 function createTimeTrigger() {
@@ -365,505 +463,77 @@ function createTimeTrigger() {
 }
 
 /**
- * 測試處理結果
- */
-function testProcess() {
-    // 檢查交易明細表郵件
-    var detailThreads = GmailApp.search('from:service@mailagent.pscnet.com.tw subject:交易明細表');
-    Logger.log('交易明細表郵件: ' + detailThreads.length + ' 封');
-
-    // 檢查成交回報郵件
-    var reportThreads = GmailApp.search('from:service@mailagent.pscnet.com.tw subject:統一證券成交回報資料');
-    Logger.log('成交回報資料郵件: ' + reportThreads.length + ' 封');
-
-    // 檢查工作表
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var tradeSheet = ss.getSheetByName('交易明細');
-    var inventorySheet = ss.getSheetByName('庫存明細');
-
-    Logger.log('交易明細工作表行數: ' + (tradeSheet ? tradeSheet.getLastRow() : '不存在'));
-    Logger.log('庫存明細工作表行數: ' + (inventorySheet ? inventorySheet.getLastRow() : '不存在'));
-
-    // 檢查標籤
-    var label1 = GmailApp.getUserLabelByName('已處理-交易明細表');
-    var label2 = GmailApp.getUserLabelByName('已處理-成交回報');
-
-    Logger.log('已處理-交易明細表 標籤郵件數: ' + (label1 ? label1.getThreads().length : '標籤不存在'));
-    Logger.log('已處理-成交回報 標籤郵件數: ' + (label2 ? label2.getThreads().length : '標籤不存在'));
-}
-
-/**
- * 檢查12月成交回報郵件
- */
-function checkDecemberReports() {
-    var threads = GmailApp.search('from:service@mailagent.pscnet.com.tw subject:統一證券成交回報資料 after:2025/12/01');
-
-    Logger.log('12月成交回報郵件: ' + threads.length + ' 封');
-
-    if (threads.length > 0) {
-        var message = threads[0].getMessages()[0];
-        var plainBody = message.getPlainBody();
-        var date = message.getDate();
-
-        Logger.log('最新郵件日期: ' + date);
-        Logger.log('===== 郵件內容 =====');
-        Logger.log(plainBody.substring(0, 2000));
-
-        // 測試解析
-        var trades = parseTradeReport(plainBody);
-        Logger.log('===== 解析結果 =====');
-        Logger.log('解析到 ' + trades.length + ' 筆交易');
-        for (var i = 0; i < trades.length; i++) {
-            Logger.log(JSON.stringify(trades[i]));
-        }
-    }
-
-    // 檢查標籤狀態
-    var label = GmailApp.getUserLabelByName('已處理-成交回報');
-    if (label) {
-        var labeledThreads = label.getThreads();
-        Logger.log('已處理-成交回報 標籤: ' + labeledThreads.length + ' 封');
-    } else {
-        Logger.log('已處理-成交回報 標籤不存在');
-    }
-}
-
-/**
- * 強制處理所有成交回報（忽略標籤）
- */
-function forceProcessReports() {
-    var threads = GmailApp.search('from:service@mailagent.pscnet.com.tw subject:統一證券成交回報資料');
-
-    Logger.log('找到 ' + threads.length + ' 封成交回報郵件');
-
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var tradeSheet = ss.getSheetByName('交易明細');
-
-    if (!tradeSheet) {
-        Logger.log('錯誤：找不到交易明細工作表');
-        return;
-    }
-
-    var label = getOrCreateLabel('已處理-成交回報');
-    var totalTrades = 0;
-
-    for (var i = 0; i < threads.length; i++) {
-        var messages = threads[i].getMessages();
-
-        for (var j = 0; j < messages.length; j++) {
-            var message = messages[j];
-            var plainBody = message.getPlainBody();
-            var receivedDate = Utilities.formatDate(message.getDate(), 'Asia/Taipei', 'yyyy-MM-dd HH:mm:ss');
-
-            var trades = parseTradeReport(plainBody);
-
-            for (var k = 0; k < trades.length; k++) {
-                var row = trades[k].concat([receivedDate, '成交回報']);
-                tradeSheet.appendRow(row);
-                totalTrades++;
-            }
-
-            message.markRead();
-        }
-
-        threads[i].addLabel(label);
-    }
-
-    Logger.log('共寫入 ' + totalTrades + ' 筆成交回報交易');
-}
-
-/**
- * 檢查工作表內容和缺漏
- */
-function checkSheetAndMissing() {
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var tradeSheet = ss.getSheetByName('交易明細');
-
-    if (!tradeSheet) {
-        Logger.log('找不到交易明細工作表');
-        return;
-    }
-
-    var lastRow = tradeSheet.getLastRow();
-    var lastCol = tradeSheet.getLastColumn();
-
-    Logger.log('交易明細工作表: ' + lastRow + ' 行, ' + lastCol + ' 欄');
-
-    // 顯示標題
-    if (lastRow >= 1) {
-        var headers = tradeSheet.getRange(1, 1, 1, lastCol).getValues()[0];
-        Logger.log('標題: ' + headers.join(' | '));
-    }
-
-    // 顯示最後幾筆資料
-    if (lastRow >= 2) {
-        Logger.log('===== 最後 5 筆資料 =====');
-        var startRow = Math.max(2, lastRow - 4);
-        var data = tradeSheet.getRange(startRow, 1, lastRow - startRow + 1, lastCol).getValues();
-        for (var i = 0; i < data.length; i++) {
-            Logger.log('行 ' + (startRow + i) + ': ' + data[i].join(' | '));
-        }
-    }
-
-    // 統計郵件類型分佈
-    if (lastRow >= 2 && lastCol >= 13) {
-        var allData = tradeSheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
-        var typeCount = {};
-        for (var i = 0; i < allData.length; i++) {
-            var type = allData[i][lastCol - 1] || '無類型';
-            typeCount[type] = (typeCount[type] || 0) + 1;
-        }
-        Logger.log('===== 郵件類型統計 =====');
-        for (var t in typeCount) {
-            Logger.log(t + ': ' + typeCount[t] + ' 筆');
-        }
-    }
-
-    // 統計交易月份分佈
-    Logger.log('===== 月份統計 =====');
-    if (lastRow >= 2) {
-        var allData = tradeSheet.getRange(2, 1, lastRow - 1, 1).getValues();
-        var monthCount = {};
-        for (var i = 0; i < allData.length; i++) {
-            var dateStr = String(allData[i][0]);
-            var month = dateStr.substring(0, 7) || '無日期';
-            monthCount[month] = (monthCount[month] || 0) + 1;
-        }
-        for (var m in monthCount) {
-            Logger.log(m + ': ' + monthCount[m] + ' 筆');
-        }
-    }
-}
-
-
-/**
- * 1. 刪除舊資料（無郵件類型的）
- */
-function deleteOldData() {
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var sheet = ss.getSheetByName('交易明細');
-
-    if (!sheet || sheet.getLastRow() < 2) {
-        Logger.log('沒有資料需要刪除');
-        return;
-    }
-
-    var lastRow = sheet.getLastRow();
-    var lastCol = sheet.getLastColumn();
-    var data = sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
-
-    // 從最後一行往前刪除（避免行號變動問題）
-    var deletedCount = 0;
-    for (var i = data.length - 1; i >= 0; i--) {
-        var mailType = data[i][lastCol - 1];  // 最後一欄是郵件類型
-        if (!mailType || mailType === '' || mailType === '無類型') {
-            sheet.deleteRow(i + 2);  // +2 因為資料從第2行開始
-            deletedCount++;
-        }
-    }
-
-    Logger.log('已刪除 ' + deletedCount + ' 筆舊資料');
-}
-
-/**
- * 2. 修正股票代碼格式（補零）
- */
-function fixStockCodes() {
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var sheet = ss.getSheetByName('交易明細');
-
-    if (!sheet || sheet.getLastRow() < 2) return;
-
-    var lastRow = sheet.getLastRow();
-    var stockCodeCol = 5;  // 股票代碼在第5欄
-    var range = sheet.getRange(2, stockCodeCol, lastRow - 1, 1);
-    var values = range.getValues();
-
-    var fixedCount = 0;
-    for (var i = 0; i < values.length; i++) {
-        var code = String(values[i][0]);
-        // 如果是4位數或以下，補零到4位
-        if (/^\d+$/.test(code) && code.length < 4) {
-            values[i][0] = code.padStart(4, '0');
-            fixedCount++;
-        } else if (/^\d+$/.test(code) && code.length === 4) {
-            values[i][0] = code;  // 保持為文字
-        } else if (/^\d+$/.test(code) && code.length < 6) {
-            values[i][0] = code.padStart(6, '0');
-            fixedCount++;
-        }
-    }
-
-    range.setValues(values);
-    Logger.log('已修正 ' + fixedCount + ' 筆股票代碼');
-}
-
-/**
- * 3. 執行清理和修正
- */
-function cleanupAndFix() {
-    deleteOldData();
-    fixStockCodes();
-    Logger.log('清理完成！');
-}
-
-/**
- * 確認目前資料
- */
-function verifyData() {
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var sheet = ss.getSheetByName('交易明細');
-
-    var lastRow = sheet.getLastRow();
-    Logger.log('目前共 ' + (lastRow - 1) + ' 筆資料');
-
-    // 顯示前5筆
-    if (lastRow >= 2) {
-        Logger.log('===== 前 5 筆資料 =====');
-        var data = sheet.getRange(2, 1, Math.min(5, lastRow - 1), 13).getValues();
-        for (var i = 0; i < data.length; i++) {
-            var row = data[i];
-            Logger.log((i + 1) + '. ' + row[0] + ' | ' + row[4] + ' | ' + row[5] + ' | ' + row[3] + ' | ' + row[6] + ' x ' + row[7] + ' | ' + row[12]);
-        }
-    }
-
-    // 月份統計
-    Logger.log('===== 月份統計 =====');
-    var allDates = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
-    var monthCount = {};
-    for (var i = 0; i < allDates.length; i++) {
-        var d = new Date(allDates[i][0]);
-        var key = d.getFullYear() + '/' + String(d.getMonth() + 1).padStart(2, '0');
-        monthCount[key] = (monthCount[key] || 0) + 1;
-    }
-    var sortedMonths = Object.keys(monthCount).sort();
-    for (var i = 0; i < sortedMonths.length; i++) {
-        Logger.log(sortedMonths[i] + ': ' + monthCount[sortedMonths[i]] + ' 筆');
-    }
-}
-
-/**
- * 修正股票代碼欄位格式（設為文字）
- */
-function fixStockCodeFormat() {
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var sheet = ss.getSheetByName('交易明細');
-
-    if (!sheet || sheet.getLastRow() < 2) return;
-
-    var lastRow = sheet.getLastRow();
-    var stockCodeCol = 5;  // 股票代碼在第5欄
-
-    // 設定整個欄位為純文字格式
-    var range = sheet.getRange(2, stockCodeCol, lastRow - 1, 1);
-    range.setNumberFormat('@');  // @ 表示純文字
-
-    // 重新寫入值（補零）
-    var values = range.getValues();
-    for (var i = 0; i < values.length; i++) {
-        var code = String(values[i][0]);
-        if (/^\d+$/.test(code)) {
-            if (code.length <= 4) {
-                values[i][0] = code.padStart(4, '0');
-            } else if (code.length < 6) {
-                values[i][0] = code.padStart(6, '0');
-            }
-        }
-    }
-
-    range.setValues(values);
-    Logger.log('已修正 ' + values.length + ' 筆股票代碼格式');
-}
-
-/**
- * 修正庫存明細的股票代碼格式
- */
-function fixInventoryStockCodeFormat() {
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var sheet = ss.getSheetByName('庫存明細');
-
-    if (!sheet || sheet.getLastRow() < 2) return;
-
-    var lastRow = sheet.getLastRow();
-    var stockCodeCol = 2;  // 庫存明細的股票代碼在第2欄
-
-    var range = sheet.getRange(2, stockCodeCol, lastRow - 1, 1);
-    range.setNumberFormat('@');
-
-    var values = range.getValues();
-    for (var i = 0; i < values.length; i++) {
-        var code = String(values[i][0]);
-        if (/^\d+$/.test(code)) {
-            if (code.length <= 4) {
-                values[i][0] = code.padStart(4, '0');
-            } else if (code.length < 6) {
-                values[i][0] = code.padStart(6, '0');
-            }
-        }
-    }
-
-    range.setValues(values);
-    Logger.log('已修正庫存明細 ' + values.length + ' 筆股票代碼格式');
-}
-
-/**
- * 修正所有工作表的股票代碼
- */
-function fixAllStockCodes() {
-    fixStockCodeFormat();           // 交易明細
-    fixInventoryStockCodeFormat();  // 庫存明細
-    Logger.log('所有股票代碼已修正！');
-}
-
-
-/**
- * 將庫存明細分成不同股票的工作表
+ * 將庫存明細分割成 0050 和 006208 兩個工作表
  */
 function splitInventoryByStock() {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
     var sourceSheet = ss.getSheetByName('庫存明細');
 
-    if (!sourceSheet || sourceSheet.getLastRow() < 2) return;
+    if (!sourceSheet || sourceSheet.getLastRow() < 2) {
+        Logger.log('庫存明細無資料');
+        return;
+    }
 
     var headers = sourceSheet.getRange(1, 1, 1, sourceSheet.getLastColumn()).getValues()[0];
     var data = sourceSheet.getRange(2, 1, sourceSheet.getLastRow() - 1, sourceSheet.getLastColumn()).getValues();
 
-    // 按股票代碼分組
-    var stockGroups = {};
+    // 定義要分割的股票
+    var targetStocks = ['0050', '006208'];
+    var stockData = { '0050': [], '006208': [] };
+
+    // 分類資料
     for (var i = 0; i < data.length; i++) {
-        var stockCode = String(data[i][1]);  // 第2欄是股票代碼
-        if (!stockGroups[stockCode]) {
-            stockGroups[stockCode] = [];
+        var rawCode = String(data[i][1]).replace(/^0+/, '');  // 移除前導零
+        var stockCode;
+
+        // 判斷是 4 位數股票還是 6 位數股票
+        if (rawCode === '50' || rawCode.length <= 2) {
+            stockCode = '0050';
+        } else if (rawCode === '6208') {
+            stockCode = '006208';
+        } else if (rawCode.length <= 4) {
+            stockCode = rawCode.padStart(4, '0');
+        } else {
+            stockCode = rawCode.padStart(6, '0');
         }
-        stockGroups[stockCode].push(data[i]);
+
+        if (stockCode === '0050') {
+            stockData['0050'].push(data[i]);
+        } else if (stockCode === '006208') {
+            stockData['006208'].push(data[i]);
+        }
     }
 
-    // 為每個股票建立工作表
-    for (var code in stockGroups) {
+    // 為每個股票建立/更新工作表
+    for (var s = 0; s < targetStocks.length; s++) {
+        var code = targetStocks[s];
         var sheetName = '庫存明細-' + code;
         var sheet = ss.getSheetByName(sheetName);
 
+        // 如果工作表不存在，建立新的
         if (!sheet) {
             sheet = ss.insertSheet(sheetName);
             sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
             sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+        } else {
+            // 清空舊資料（保留標題）
+            if (sheet.getLastRow() > 1) {
+                sheet.deleteRows(2, sheet.getLastRow() - 1);
+            }
         }
 
-        var rows = stockGroups[code];
+        // 寫入資料
+        var rows = stockData[code];
         if (rows.length > 0) {
-            sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, headers.length).setValues(rows);
+            sheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
+
+            // 設定股票代碼欄為純文字格式
+            var codeRange = sheet.getRange(2, 2, rows.length, 1);
+            codeRange.setNumberFormat('@');
         }
 
-        Logger.log('已建立 ' + sheetName + '：' + rows.length + ' 筆');
+        Logger.log(sheetName + '：' + rows.length + ' 筆資料');
     }
 
-    Logger.log('分割完成！');
-}
-
-/**
- * 修正庫存明細分割工作表的格式
- */
-function fixSplitInventoryFormat() {
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var sheetNames = ['庫存明細-0050', '庫存明細-006208', '庫存明細-50', '庫存明細-6208'];
-
-    for (var s = 0; s < sheetNames.length; s++) {
-        var sheet = ss.getSheetByName(sheetNames[s]);
-        if (!sheet || sheet.getLastRow() < 2) continue;
-
-        var lastRow = sheet.getLastRow();
-
-        // 修正日期格式（第1欄）
-        var dateRange = sheet.getRange(2, 1, lastRow - 1, 1);
-        var dates = dateRange.getValues();
-        for (var i = 0; i < dates.length; i++) {
-            var d = new Date(dates[i][0]);
-            if (!isNaN(d.getTime())) {
-                var year = d.getFullYear();
-                var month = String(d.getMonth() + 1).padStart(2, '0');
-                var day = String(d.getDate()).padStart(2, '0');
-                dates[i][0] = year + '/' + month + '/' + day;
-            }
-        }
-        dateRange.setValues(dates);
-
-        // 修正股票代碼格式（第2欄）
-        var codeRange = sheet.getRange(2, 2, lastRow - 1, 1);
-        codeRange.setNumberFormat('@');  // 設為純文字
-        var codes = codeRange.getValues();
-        for (var i = 0; i < codes.length; i++) {
-            var code = String(codes[i][0]);
-            if (/^\d+$/.test(code)) {
-                if (code.length <= 4) {
-                    codes[i][0] = code.padStart(4, '0');
-                } else if (code.length < 6) {
-                    codes[i][0] = code.padStart(6, '0');
-                }
-            }
-        }
-        codeRange.setValues(codes);
-
-        Logger.log('已修正 ' + sheetNames[s] + ' 格式');
-    }
-
-    // 重新命名工作表（如果名稱不正確）
-    var sheet50 = ss.getSheetByName('庫存明細-50');
-    if (sheet50) {
-        sheet50.setName('庫存明細-0050');
-        Logger.log('已重新命名為 庫存明細-0050');
-    }
-
-    var sheet6208 = ss.getSheetByName('庫存明細-6208');
-    if (sheet6208) {
-        sheet6208.setName('庫存明細-006208');
-        Logger.log('已重新命名為 庫存明細-006208');
-    }
-
-    Logger.log('格式修正完成！');
-}
-
-/**
- * 強制修正日期格式
- */
-function fixDateFormat() {
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var sheetNames = ['庫存明細-0050', '庫存明細-006208'];
-
-    for (var s = 0; s < sheetNames.length; s++) {
-        var sheet = ss.getSheetByName(sheetNames[s]);
-        if (!sheet || sheet.getLastRow() < 2) continue;
-
-        var lastRow = sheet.getLastRow();
-        var dateRange = sheet.getRange(2, 1, lastRow - 1, 1);
-
-        // 先設定為純文字格式
-        dateRange.setNumberFormat('@');
-
-        var dates = dateRange.getValues();
-        for (var i = 0; i < dates.length; i++) {
-            var val = dates[i][0];
-            var d;
-
-            // 嘗試解析不同格式的日期
-            if (val instanceof Date) {
-                d = val;
-            } else {
-                d = new Date(val);
-            }
-
-            if (!isNaN(d.getTime())) {
-                var year = d.getFullYear();
-                var month = String(d.getMonth() + 1).padStart(2, '0');
-                var day = String(d.getDate()).padStart(2, '0');
-                dates[i][0] = year + '/' + month + '/' + day;
-            } else {
-                Logger.log('無法解析日期: ' + val);
-            }
-        }
-
-        dateRange.setValues(dates);
-        Logger.log('已修正 ' + sheetNames[s] + ' 的日期格式，共 ' + dates.length + ' 筆');
-    }
-
-    Logger.log('日期格式修正完成！');
+    Logger.log('庫存明細分割完成！');
 }
