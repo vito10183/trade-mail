@@ -79,7 +79,7 @@
 const TRADE_SHEET_NAME = '交易明細';       // 交易明細工作表名稱
 const INVENTORY_SHEET_NAME = '庫存明細';   // 庫存明細工作表名稱
 const PROCESSED_LABEL_DETAIL = '已處理-交易明細表'; // 郵件標籤名稱
-
+```
 
 ## 📄 授權與免責聲明 (License & Disclaimer)
 
